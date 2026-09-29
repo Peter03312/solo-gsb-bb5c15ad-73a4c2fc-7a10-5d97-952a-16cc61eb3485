@@ -373,8 +373,73 @@ const state = {
   idx: 0,
   observations: [], // 试印核验观察（规范化后的本地副本，index 为 1 起始序号）
   highlight: null,  // 核验定位高亮 { si, shi, side, position }
-  lastPayload: null, // 最近一次成功生成拼版的请求体（核验时原样复用并附加观察）
+  lastPayload: null, // 最近一次成功生成拼版的请求体（核验时原样复用并附加观察；失败的输入不会写入）
 };
+
+/* ------------------- 请求归属：生成 / 重核结果乱序防护 ------------------- */
+
+// 「生成拼版」与「试印重核」（含观察变化触发的自动重核）共用同一条 /api/impose
+// 请求通道。每次提交都取得一个严格递增的操作序号，只有最后发起的操作允许写回页面：
+// 较早的请求无论成功还是失败，其响应一律丢弃，不改动拼版结果、逐张导航、核验结论、
+// 定位高亮、错误提示与导出数据。发起新操作时同时 abort 上一个仍在途的请求，
+// 既保证归属又避免旧任务继续占用 worker 线程池（在途任务堆积可能让后续请求收到 503）。
+let imposeSeq = 0;
+let activeAbort = null;
+
+/**
+ * 以「发起即生效」的方式提交一次 /api/impose 操作（生成或试印重核）。
+ *
+ * @param {() => object} buildPayload 在操作发起时同步快照本次请求体
+ *   （拼版输入取当时的表单 / 上次成功输入，观察取当时的 state.observations）；
+ *   本地校验在此抛出时，本次操作同样取代在途旧请求，旧响应不得再写回页面。
+ * @param {{onOk: (data: object, payload: object) => void, onFail: (message: string) => void}} handlers
+ *   仅当本操作仍是最后发起的操作时回调：成功走 onOk、失败走 onFail；
+ *   被更新操作取代（含 abort）或乱序完成的旧请求一律静默，不触碰任何页面状态。
+ */
+async function submitImposition(buildPayload, { onOk, onFail }) {
+  imposeSeq += 1;
+  const seq = imposeSeq;
+  if (activeAbort) activeAbort.abort();
+  const controller = new AbortController();
+  activeAbort = controller;
+
+  let payload;
+  try {
+    payload = buildPayload();
+  } catch (err) {
+    // 本地表单校验失败：若期间没有更新的操作发起，按本次操作失败处理（保留上次成功结果）。
+    if (seq === imposeSeq) onFail(err.message);
+    return;
+  }
+
+  let outcome;
+  try {
+    const resp = await fetch('/api/impose', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      signal: controller.signal,
+    });
+    // 响应头到达后再判定一次归属：等待期间可能已有更新的操作发起。
+    if (seq !== imposeSeq) return;
+    const data = await resp.json().catch(() => null);
+    if (seq !== imposeSeq) return;
+    if (!resp.ok) {
+      outcome = { ok: false, message: (data && data.error) || `服务器返回 ${resp.status}` };
+    } else {
+      outcome = { ok: true, data };
+    }
+  } catch (err) {
+    // 被更新操作 abort、或本操作已不是最后发起的操作：静默丢弃，不得改动当前页面。
+    if (seq !== imposeSeq || err.name === 'AbortError') return;
+    outcome = { ok: false, message: err.message };
+  }
+  // 回调放在 try/catch 之外：渲染异常不得被误报为「生成 / 核验失败」；
+  // await 微线程间隙仍可能有更新的操作发起，结算前最后再判定一次归属。
+  if (seq !== imposeSeq) return;
+  if (outcome.ok) onOk(outcome.data, payload);
+  else onFail(outcome.message);
+}
 
 /* ------------------------------ 数据获取与渲染 ------------------------------ */
 
@@ -398,90 +463,92 @@ function rebuildFlat() {
   });
 }
 
-form.addEventListener('submit', async (event) => {
+form.addEventListener('submit', (event) => {
   event.preventDefault();
+  // 每次提交都取代在途的生成 / 重核请求：先清掉两类错误提示，避免旧失败误显示为本次失败。
   errorBox.hidden = true;
+  obsError.hidden = true;
 
-  try {
-    const chapterSplit = chapterSplitBox.checked;
-    const payload = {
-      totalPages: Number(document.getElementById('totalPages').value),
-      sheetsPerSignature: Number(document.getElementById('sheetsPerSignature').value),
-      balancedSplit: balancedSplitBox.checked,
-      chapterSplit,
-      chapterStarts: chapterSplit ? parseChapterStarts(chapterStartsInput.value) : [],
-      binding: document.getElementById('binding').value,
-      flip: document.getElementById('flip').value,
-      paperThickness: Number(document.getElementById('paperThickness').value),
-      maxCompensation: Number(document.getElementById('maxCompensation').value),
-      paperWidth: Number(document.getElementById('paperWidth').value),
-      paperHeight: Number(document.getElementById('paperHeight').value),
-      pageWidth: Number(document.getElementById('pageWidth').value),
-      pageHeight: Number(document.getElementById('pageHeight').value),
-      bleedMm: Number(document.getElementById('bleedMm').value),
-      safetyMm: Number(document.getElementById('safetyMm').value),
-      productionMarks: productionMarksBox.checked,
-      // 仅勾选启用时上送尺寸；留空 / 未勾选时由服务端取缺省（不参与未启用流程）
-      markSizeMm: productionMarksBox.checked && markSizeInput.value.trim() !== ''
-        ? Number(markSizeInput.value)
-        : undefined,
-      // 印刷备料：仅勾选时上送；过程损耗率按输入文本精确换算（0.9% -> "0.009"，见 percentRate.js），
-      // 不做 Number()/100 浮点除法——否则 0.9% 会被传成 0.009000000000000001，
-      // 服务端按字面值精确解析后比真实损耗率略大，逐帖 ceil 可能多取一张、整包采购随之多算。
-      // 非法输入（空 / 超 99.999 / 超过三位小数等）在此抛出可读错误并展示在错误条中。
-      materialPrep: materialPrepBox.checked
-        ? {
-            copies: Number(prepCopiesInput.value),
-            makereadySheets: Number(prepMakereadyInput.value),
-            processWasteRate: percentTextToRate(prepWasteRateInput.value),
-            sheetsPerPack: Number(prepSheetsPerPackInput.value),
-          }
-        : undefined,
-      // 采购报价组合：仅勾选时上送；价格在收集阶段已精确换算为整数分。
-      // demandSheets 未手工填写时不上送，由服务端回退到备料整包采购张数。
-      purchaseQuotes: (() => {
-        if (!purchaseQuotesBox.checked) return undefined;
-        const { quotes, demandSheets } = collectPurchaseQuotes();
-        return { demandSheets, quotes };
-      })(),
-      // 双版本共版印刷：仅勾选时上送；改动页码在前端做轻量分词，完整校验由服务端执行
-      dualVersion: dualVersionBox.checked
-        ? {
-            copiesA: Number(dvCopiesAInput.value),
-            copiesB: Number(dvCopiesBInput.value),
-            changedPages: parseChangedPagesInput(dvChangedPagesInput.value),
-          }
-        : undefined,
-      // 库存批次领纸：仅勾选时上送；需先启用印刷备料（未启用时服务端返回明确错误）。
-      // 允许帖号留空 = 通用批（不上送 allowedSignatures）。
-      stockBatches: (() => {
-        if (!stockBatchesBox.checked) return undefined;
-        return collectStockBatches();
-      })(),
-    };
-    // 已录入观察时随生成一并核验；无观察时请求体与原流程完全一致
-    const requestBody = state.observations.length ? { ...payload, observations: observationPayload() } : payload;
-
-    const resp = await fetch('/api/impose', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(requestBody),
-    });
-    const data = await resp.json();
-    if (!resp.ok) {
-      throw new Error(data.error || `服务器返回 ${resp.status}`);
+  submitImposition(
+    () => {
+      const chapterSplit = chapterSplitBox.checked;
+      const payload = {
+        totalPages: Number(document.getElementById('totalPages').value),
+        sheetsPerSignature: Number(document.getElementById('sheetsPerSignature').value),
+        balancedSplit: balancedSplitBox.checked,
+        chapterSplit,
+        chapterStarts: chapterSplit ? parseChapterStarts(chapterStartsInput.value) : [],
+        binding: document.getElementById('binding').value,
+        flip: document.getElementById('flip').value,
+        paperThickness: Number(document.getElementById('paperThickness').value),
+        maxCompensation: Number(document.getElementById('maxCompensation').value),
+        paperWidth: Number(document.getElementById('paperWidth').value),
+        paperHeight: Number(document.getElementById('paperHeight').value),
+        pageWidth: Number(document.getElementById('pageWidth').value),
+        pageHeight: Number(document.getElementById('pageHeight').value),
+        bleedMm: Number(document.getElementById('bleedMm').value),
+        safetyMm: Number(document.getElementById('safetyMm').value),
+        productionMarks: productionMarksBox.checked,
+        // 仅勾选启用时上送尺寸；留空 / 未勾选时由服务端取缺省（不参与未启用流程）
+        markSizeMm: productionMarksBox.checked && markSizeInput.value.trim() !== ''
+          ? Number(markSizeInput.value)
+          : undefined,
+        // 印刷备料：仅勾选时上送；过程损耗率按输入文本精确换算（0.9% -> "0.009"，见 percentRate.js），
+        // 不做 Number()/100 浮点除法——否则 0.9% 会被传成 0.009000000000000001，
+        // 服务端按字面值精确解析后比真实损耗率略大，逐帖 ceil 可能多取一张、整包采购随之多算。
+        // 非法输入（空 / 超 99.999 / 超过三位小数等）在此抛出可读错误并展示在错误条中。
+        materialPrep: materialPrepBox.checked
+          ? {
+              copies: Number(prepCopiesInput.value),
+              makereadySheets: Number(prepMakereadyInput.value),
+              processWasteRate: percentTextToRate(prepWasteRateInput.value),
+              sheetsPerPack: Number(prepSheetsPerPackInput.value),
+            }
+          : undefined,
+        // 采购报价组合：仅勾选时上送；价格在收集阶段已精确换算为整数分。
+        // demandSheets 未手工填写时不上送，由服务端回退到备料整包采购张数。
+        purchaseQuotes: (() => {
+          if (!purchaseQuotesBox.checked) return undefined;
+          const { quotes, demandSheets } = collectPurchaseQuotes();
+          return { demandSheets, quotes };
+        })(),
+        // 双版本共版印刷：仅勾选时上送；改动页码在前端做轻量分词，完整校验由服务端执行
+        dualVersion: dualVersionBox.checked
+          ? {
+              copiesA: Number(dvCopiesAInput.value),
+              copiesB: Number(dvCopiesBInput.value),
+              changedPages: parseChangedPagesInput(dvChangedPagesInput.value),
+            }
+          : undefined,
+        // 库存批次领纸：仅勾选时上送；需先启用印刷备料（未启用时服务端返回明确错误）。
+        // 允许帖号留空 = 通用批（不上送 allowedSignatures）。
+        stockBatches: (() => {
+          if (!stockBatchesBox.checked) return undefined;
+          return collectStockBatches();
+        })(),
+      };
+      // 已录入观察时随生成一并核验；无观察时请求体与原流程完全一致。
+      // 观察在提交瞬间快照，后续增删不影响已发出的这次操作。
+      return state.observations.length ? { ...payload, observations: observationPayload() } : payload;
+    },
+    {
+      onOk: (data, payload) => {
+        state.result = data;
+        // 仅生成成功后更新，保证「开始核验」比对的就是当前展示的结果；失败的输入不会成为后续重核基准。
+        state.lastPayload = payload;
+        rebuildFlat();
+        state.idx = 0;
+        state.highlight = null;
+        resultCard.hidden = false;
+        renderAll();
+      },
+      onFail: (message) => {
+        // 最后发起的生成失败：保留上次成功结果（state.result 不变），仅给出本次错误提示。
+        errorBox.textContent = `生成失败：${message}`;
+        errorBox.hidden = false;
+      },
     }
-    state.result = data;
-    state.lastPayload = payload; // 仅生成成功后更新，保证「开始核验」比对的就是当前展示的结果
-    rebuildFlat();
-    state.idx = 0;
-    state.highlight = null;
-    resultCard.hidden = false;
-    renderAll();
-  } catch (err) {
-    errorBox.textContent = `生成失败：${err.message}`;
-    errorBox.hidden = false;
-  }
+  );
 });
 
 prevBtn.addEventListener('click', () => {
@@ -1298,32 +1365,41 @@ function afterObservationsChanged() {
   }
 }
 
-/** 以最近一次生成的输入 + 当前观察重新请求 /api/impose 并刷新全部展示。 */
-async function runVerification() {
+/**
+ * 以最近一次生成的输入 + 当前观察重新请求 /api/impose 并刷新全部展示。
+ * 与「生成拼版」共用同一操作序号：重核（含观察变化触发的自动重核）发起时即取代
+ * 在途的生成 / 重核请求，只有仍是最后发起的操作才能写回结果与错误提示；
+ * 乱序完成的旧重核无论成功失败都不改动当前页面。
+ */
+function runVerification() {
   if (!state.lastPayload) return;
-  const payload = { ...state.lastPayload };
-  if (state.observations.length) {
-    payload.observations = observationPayload();
-  }
-  try {
-    const resp = await fetch('/api/impose', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    const data = await resp.json();
-    if (!resp.ok) {
-      throw new Error(data.error || `服务器返回 ${resp.status}`);
+  // 提交瞬间快照基准输入与观察；重核失败时 state.lastPayload 保持不变（不会把失败输入记录为基准）。
+  obsError.hidden = true;
+  submitImposition(
+    () => {
+      const payload = { ...state.lastPayload };
+      if (state.observations.length) {
+        payload.observations = observationPayload();
+      } else {
+        delete payload.observations;
+      }
+      return payload;
+    },
+    {
+      onOk: (data) => {
+        state.result = data;
+        rebuildFlat();
+        state.idx = Math.min(state.idx, state.flat.length - 1);
+        // 重核后旧的定位高亮可能已指向被删除的观察，统一清除，避免与最新结果不同步
+        state.highlight = null;
+        renderAll();
+      },
+      onFail: (message) => {
+        // 最后发起的重核失败：保留上次成功结果与结论，仅在核验区提示本次错误。
+        showObsError(`核验失败：${message}`);
+      },
     }
-    state.result = data;
-    rebuildFlat();
-    state.idx = Math.min(state.idx, state.flat.length - 1);
-    // 重核后旧的定位高亮可能已指向被删除的观察，统一清除，避免与最新结果不同步
-    state.highlight = null;
-    renderAll();
-  } catch (err) {
-    showObsError(`核验失败：${err.message}`);
-  }
+  );
 }
 
 /** 跳到观察 / 差异 / 建议对应的纸张并高亮页位。 */
